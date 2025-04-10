@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
-set(PROJECT_NAME "flutter_pos_printer_platform_image_3")
+set(PROJECT_NAME "flutter_pos_printer_platform")
 project(${PROJECT_NAME} LANGUAGES CXX)
 
 # This value is used when generating builds using this plugin, so it must
 # not be changed
-set(PLUGIN_NAME "${PROJECT_NAME}_plugin")
+set(PLUGIN_NAME "flutter_pos_printer_platform_plugin")
 
 add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 
