@@ -25,6 +25,9 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
     private var mUsbDeviceConnection: UsbDeviceConnection? = null
     private var mUsbInterface: UsbInterface? = null
     private var mEndPoint: UsbEndpoint? = null
+    private var pendingUsbDevice: UsbDevice? = null
+    private var pendingPrintBytes: ArrayList<Int>? = null
+
     var state: Int = STATE_USB_NONE
 
     fun setHandler(handler: Handler?) {
@@ -36,29 +39,56 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
 
             if (ACTION_USB_PERMISSION == action) {
                 synchronized(this) {
-                    val usbDevice: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-                    } else {
-                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-                    }
+                    val usbDevice: UsbDevice? =
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                            // Android 14+ does NOT send EXTRA_DEVICE reliably
+                            pendingUsbDevice
+                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                        } else {
+                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                        }
+
 
 
                     if (usbDevice == null) {
-                        Log.e(LOG_TAG, "USB device is null in ACTION_USB_PERMISSION. Extras: ${intent.extras}")
+                        Log.e(LOG_TAG, "USB permission granted but device is null (API 34 fallback failed)")
                         return
                     }
 
-                    val permissionGranted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    if (permissionGranted) {
-                        Log.i(LOG_TAG, "Permission granted for device: ${usbDevice.deviceName}")
+
+                    val permissionGranted =
+                        intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+
+                    Log.v(
+                        LOG_TAG,
+                        "USB permission result: granted=$permissionGranted device=$usbDevice"
+                    )
+
+                    if (permissionGranted && usbDevice != null) {
                         mUsbDevice = usbDevice
-                        state = STATE_USB_CONNECTED
-                        mHandler?.obtainMessage(STATE_USB_CONNECTED)?.sendToTarget()
+                        pendingUsbDevice = null
+
+                        if (openConnection()) {
+                            state = STATE_USB_CONNECTED
+                            mHandler?.obtainMessage(STATE_USB_CONNECTED)?.sendToTarget()
+
+                            pendingPrintBytes?.let {
+                                Log.v(LOG_TAG, "Printing queued data after USB connected")
+                                doPrintBytes(it)
+                                pendingPrintBytes = null
+                            }
+                        }
                     } else {
-                        Log.w(LOG_TAG, "Permission denied for device: ${usbDevice.deviceName}")
+                        Log.e(LOG_TAG, "USB permission denied or not delivered")
                         state = STATE_USB_NONE
                         mHandler?.obtainMessage(STATE_USB_NONE)?.sendToTarget()
                     }
+
+
+
+
+
                 }
             } else if (UsbManager.ACTION_USB_DEVICE_DETACHED == action) {
                 mUsbDevice?.let {
@@ -115,30 +145,62 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
 
       */
 
-    fun init(reactContext: Context?) {
-        mContext = reactContext
-        mUSBManager = mContext!!.getSystemService(Context.USB_SERVICE) as UsbManager
-        mPermissionIndent = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-            PendingIntent.getBroadcast(mContext, 0, Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_MUTABLE)
-        } else {
-            PendingIntent.getBroadcast(mContext, 0, Intent(ACTION_USB_PERMISSION), 0)
+    fun init(context: Context?) {
+        mContext = context
+        mUSBManager = mContext?.getSystemService(Context.USB_SERVICE) as UsbManager
+
+        val permissionIntent = Intent(ACTION_USB_PERMISSION).apply {
+            setPackage(mContext?.packageName) // ✅ make intent explicit (extra safe)
         }
-        val filter = IntentFilter(ACTION_USB_PERMISSION)
-        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        mContext!!.registerReceiver(mUsbDeviceReceiver, filter)
-        Log.v(LOG_TAG, "ESC/POS Printer initialized")
+
+        mPermissionIndent =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.getBroadcast(
+                    mContext,
+                    0,
+                    permissionIntent,
+                    PendingIntent.FLAG_IMMUTABLE
+                )
+            } else {
+                PendingIntent.getBroadcast(
+                    mContext,
+                    0,
+                    permissionIntent,
+                    0
+                )
+            }
+
+        val filter = IntentFilter(ACTION_USB_PERMISSION).apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            mContext!!.registerReceiver(
+                mUsbDeviceReceiver,
+                filter,
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            mContext!!.registerReceiver(mUsbDeviceReceiver, filter)
+        }
+
+        Log.v(LOG_TAG, "ESC/POS USB Printer initialized (API 34+ safe)")
     }
 
+
+
     fun closeConnectionIfExists() {
-        if (mUsbDeviceConnection != null) {
-            mUsbDeviceConnection!!.releaseInterface(mUsbInterface)
-            mUsbDeviceConnection!!.close()
-            mUsbInterface = null
-            mEndPoint = null
-            mUsbDevice = null
-            mUsbDeviceConnection = null
-        }
+        mUsbDeviceConnection?.releaseInterface(mUsbInterface)
+        mUsbDeviceConnection?.close()
+
+        mUsbInterface = null
+        mEndPoint = null
+        mUsbDevice = null
+        mUsbDeviceConnection = null
     }
+
+
 
     val deviceList: List<UsbDevice>
         get() {
@@ -150,16 +212,50 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         }
 
     fun selectDevice(vendorId: Int, productId: Int): Boolean {
-//        Log.v(LOG_TAG, " status usb ______ $state")
-        if ((mUsbDevice == null) || (mUsbDevice!!.vendorId != vendorId) || (mUsbDevice!!.productId != productId)) {
+        if ((mUsbDevice == null) ||
+            (mUsbDevice!!.vendorId != vendorId) ||
+            (mUsbDevice!!.productId != productId)
+        ) {
             synchronized(printLock) {
                 closeConnectionIfExists()
-                val usbDevices: List<UsbDevice> = deviceList
-                for (usbDevice: UsbDevice in usbDevices) {
-                    if ((usbDevice.vendorId == vendorId) && (usbDevice.productId == productId)) {
-                        Log.v(LOG_TAG, "Request for device: vendor_id: " + usbDevice.vendorId + ", product_id: " + usbDevice.productId)
-                        closeConnectionIfExists()
+
+                val usbDevices = deviceList
+                for (usbDevice in usbDevices) {
+                    if (usbDevice.vendorId == vendorId && usbDevice.productId == productId) {
+                        Log.v(LOG_TAG, "Request for device: vendor_id=${usbDevice.vendorId}, product_id=${usbDevice.productId}")
+
+                        // ✅ ENSURE PendingIntent
+                        if (mPermissionIndent == null) {
+                            Log.e(LOG_TAG, "PendingIntent null, reinitializing")
+                            init(mContext)
+                        }
+
+                        if (mPermissionIndent == null) {
+                            Log.e(LOG_TAG, "PendingIntent still null, aborting")
+                            return false
+                        }
+
+                        if (mUSBManager!!.hasPermission(usbDevice)) {
+                            Log.v(LOG_TAG, "USB permission already granted")
+
+                            mUsbDevice = usbDevice
+                            pendingUsbDevice = null
+
+                            if (openConnection()) {
+                                state = STATE_USB_CONNECTED
+                                mHandler?.obtainMessage(STATE_USB_CONNECTED)?.sendToTarget()
+
+                                pendingPrintBytes?.let {
+                                    doPrintBytes(it)
+                                    pendingPrintBytes = null
+                                }
+                            }
+                            return true
+                        }
+
+                        pendingUsbDevice = usbDevice
                         mUSBManager!!.requestPermission(usbDevice, mPermissionIndent)
+
                         state = STATE_USB_CONNECTING
                         mHandler?.obtainMessage(STATE_USB_CONNECTING)?.sendToTarget()
                         return true
@@ -170,48 +266,38 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         } else {
             mHandler?.obtainMessage(state)?.sendToTarget()
         }
-
         return true
     }
+
     private fun openConnection(): Boolean {
-        if (mUsbDevice == null) {
-            Log.e(LOG_TAG, "USB Device is not initialized")
-            return false
-        }
-        if (mUSBManager == null) {
-            Log.e(LOG_TAG, "USB Manager is not initialized")
-            return false
-        }
-        if (mUsbDeviceConnection != null) {
-            Log.i(LOG_TAG, "USB Connection already connected")
-            return true
-        }
-        val usbInterface = mUsbDevice!!.getInterface(0)
-        for (i in 0 until usbInterface.endpointCount) {
-            val ep = usbInterface.getEndpoint(i)
-            if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                if (ep.direction == UsbConstants.USB_DIR_OUT) {
-                    val usbDeviceConnection = mUSBManager!!.openDevice(mUsbDevice)
-                    if (usbDeviceConnection == null) {
-                        Log.e(LOG_TAG, "Failed to open USB Connection")
-                        return false
-                    }
-                    Toast.makeText(mContext, mContext?.getString(R.string.connected_device), Toast.LENGTH_SHORT).show()
-                    return if (usbDeviceConnection.claimInterface(usbInterface, true)) {
-                        mEndPoint = ep
+        if (mUsbDevice == null || mUSBManager == null) return false
+
+        if (mUsbDeviceConnection != null) return true
+
+        for (i in 0 until mUsbDevice!!.interfaceCount) {
+            val usbInterface = mUsbDevice!!.getInterface(i)
+            for (j in 0 until usbInterface.endpointCount) {
+                val ep = usbInterface.getEndpoint(j)
+                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
+                    ep.direction == UsbConstants.USB_DIR_OUT) {
+
+                    val connection = mUSBManager!!.openDevice(mUsbDevice)
+                        ?: return false
+
+                    if (connection.claimInterface(usbInterface, true)) {
                         mUsbInterface = usbInterface
-                        mUsbDeviceConnection = usbDeviceConnection
-                        true
+                        mEndPoint = ep
+                        mUsbDeviceConnection = connection
+                        return true
                     } else {
-                        usbDeviceConnection.close()
-                        Log.e(LOG_TAG, "Failed to retrieve usb connection")
-                        false
+                        connection.close()
                     }
                 }
             }
         }
-        return true
+        return false
     }
+
 
     fun printText(text: String): Boolean {
         Log.v(LOG_TAG, "Printing text")
@@ -252,48 +338,58 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
     }
 
     fun printBytes(bytes: ArrayList<Int>): Boolean {
-        Log.v(LOG_TAG, "Printing bytes")
-        val isConnected = openConnection()
-        if (isConnected) {
-            val chunkSize = mEndPoint!!.maxPacketSize
-            Log.v(LOG_TAG, "Max Packet Size: $chunkSize")
-            Log.v(LOG_TAG, "Connected to device")
-            Thread {
-                synchronized(printLock) {
-                    val vectorData: Vector<Byte> = Vector()
-                    for (i in bytes.indices) {
-                        val `val`: Int = bytes[i]
-                        vectorData.add(`val`.toByte())
-                    }
-                    val temp: Array<Any> = vectorData.toTypedArray()
-                    val byteData = ByteArray(temp.size)
-                    for (i in temp.indices) {
-                        byteData[i] = temp[i] as Byte
-                    }
-                    var b = 0
-                    if (mUsbDeviceConnection != null) {
-                        if (byteData.size > chunkSize) {
-                            var chunks: Int = byteData.size / chunkSize
-                            if (byteData.size % chunkSize > 0) {
-                                ++chunks
-                            }
-                            for (i in 0 until chunks) {
-//                                val buffer: ByteArray = byteData.copyOfRange(i * chunkSize, chunkSize + i * chunkSize)
-                                val buffer: ByteArray = Arrays.copyOfRange(byteData, i * chunkSize, chunkSize + i * chunkSize)
-                                b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, buffer, chunkSize, 100000)
-                            }
-                        } else {
-                            b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, byteData, byteData.size, 100000)
-                        }
-                        Log.i(LOG_TAG, "Return code: $b")
-                    }
-                }
-            }.start()
+        // 🔴 USB not ready yet → queue print
+        if (mUsbDevice == null) {
+            Log.w(LOG_TAG, "USB not connected yet, queueing print")
+            pendingPrintBytes = bytes
             return true
-        } else {
+        }
+
+        return doPrintBytes(bytes)
+    }
+    private fun doPrintBytes(bytes: ArrayList<Int>): Boolean {
+        Log.v(LOG_TAG, "Printing bytes")
+
+        val isConnected = openConnection()
+        if (!isConnected) {
             Log.v(LOG_TAG, "Failed to connected to device")
             return false
         }
+
+        val chunkSize = mEndPoint!!.maxPacketSize
+        Log.v(LOG_TAG, "Connected to device")
+
+        Thread {
+            synchronized(printLock) {
+                val byteData = bytes.map { it.toByte() }.toByteArray()
+
+                if (byteData.size > chunkSize) {
+                    var chunks = byteData.size / chunkSize
+                    if (byteData.size % chunkSize > 0) chunks++
+
+                    for (i in 0 until chunks) {
+                        val start = i * chunkSize
+                        val end = minOf(start + chunkSize, byteData.size)
+                        val buffer = Arrays.copyOfRange(byteData, start, end)
+                        mUsbDeviceConnection!!.bulkTransfer(
+                            mEndPoint,
+                            buffer,
+                            buffer.size,
+                            100000
+                        )
+                    }
+                } else {
+                    mUsbDeviceConnection!!.bulkTransfer(
+                        mEndPoint,
+                        byteData,
+                        byteData.size,
+                        100000
+                    )
+                }
+            }
+        }.start()
+
+        return true
     }
 
     companion object {
